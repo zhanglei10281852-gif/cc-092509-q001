@@ -63,10 +63,55 @@ class DossierLifecycleService:
     def create_batch(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.write")
         now = to_storage(self.clock.now())
-        payload = f"dossier-batch:{data['intake_code']}:{data['project_code']}"
-        batch = self.batches.create(data, principal.user_id, payload, now)
+        qr_payload = self._batch_qr_payload(data)
+
+        existing = self.batches.by_code(data["intake_code"])
+        if existing is not None:
+            return self._replay_or_conflict(principal, existing, data, qr_payload)
+
+        try:
+            batch = self.batches.create(data, principal.user_id, qr_payload, now)
+        except sqlite3.IntegrityError:
+            # 并发重试下另一事务已先行提交：重新读取并按重放/冲突处理
+            existing = self.batches.by_code(data["intake_code"])
+            if existing is None:
+                raise
+            return self._replay_or_conflict(principal, existing, data, qr_payload)
+
         self.audit.record(principal, "batch.receive", "receipt_batch", str(batch["id"]), after=batch)
-        return batch
+        return {**batch, "replayed": False}
+
+    @staticmethod
+    def _batch_qr_payload(data: dict[str, Any]) -> str:
+        return f"dossier-batch:{data['intake_code']}:{data['project_code']}"
+
+    def _replay_or_conflict(
+        self,
+        principal: Principal,
+        existing: dict[str, Any],
+        data: dict[str, Any],
+        qr_payload: str,
+    ) -> dict[str, Any]:
+        del principal, qr_payload  # 权限已在 create_batch 入口校验；qr_payload 由批次编码与项目编码确定性派生
+        conflict_fields = [
+            field
+            for field, incoming, stored in (
+                ("project_code", data["project_code"], existing["project_code"]),
+                ("expected_count", data["expected_count"], existing["expected_count"]),
+            )
+            if incoming != stored
+        ]
+        if conflict_fields:
+            raise ConflictError(
+                "批次编码已经被不同业务信息占用",
+                context={
+                    "intake_code": existing["intake_code"],
+                    "conflict_fields": conflict_fields,
+                    "existing_batch_id": existing["id"],
+                },
+            )
+        # 安全重放：返回最初批次并打重放标记，不新增批次、不改动计数、不重复审计
+        return {**existing, "replayed": True}
 
     def register_dossier(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.write")
