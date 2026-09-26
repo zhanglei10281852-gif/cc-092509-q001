@@ -52,6 +52,9 @@ class VaultService:
 
 
 class DossierLifecycleService:
+    # 重放判定所依据的业务字段：批次编码相同但这些字段不同即构成业务冲突
+    BATCH_BUSINESS_FIELDS = ("project_code", "expected_count")
+
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
         self.connection = connection
         self.clock = clock or SystemClock()
@@ -63,10 +66,64 @@ class DossierLifecycleService:
     def create_batch(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.write")
         now = to_storage(self.clock.now())
-        payload = f"dossier-batch:{data['intake_code']}:{data['project_code']}"
-        batch = self.batches.create(data, principal.user_id, payload, now)
+        existing = self.batches.by_code(data["intake_code"])
+        if existing is not None:
+            return self._resolve_existing_batch(principal, data, existing)
+        qr_payload = f"dossier-batch:{data['intake_code']}:{data['project_code']}"
+        try:
+            batch = self.batches.create(data, principal.user_id, qr_payload, now)
+        except sqlite3.IntegrityError:
+            # 并发事务抢先提交了同一编码：在当前事务内重读，按重放或业务冲突处理
+            existing = self.batches.by_code(data["intake_code"])
+            if existing is None:
+                raise
+            return self._resolve_existing_batch(principal, data, existing)
         self.audit.record(principal, "batch.receive", "receipt_batch", str(batch["id"]), after=batch)
-        return batch
+        return {"outcome": "created", "batch": batch}
+
+    def _resolve_existing_batch(
+        self, principal: Principal, data: dict[str, Any], existing: dict[str, Any]
+    ) -> dict[str, Any]:
+        conflict_fields = [
+            field for field in self.BATCH_BUSINESS_FIELDS if existing.get(field) != data[field]
+        ]
+        if conflict_fields:
+            submitted = {field: data[field] for field in conflict_fields}
+            stored = {field: existing.get(field) for field in conflict_fields}
+            self.audit.record(
+                principal,
+                "batch.receive.conflict",
+                "receipt_batch",
+                str(existing["id"]),
+                outcome="denied",
+                before=stored,
+                metadata={
+                    "intake_code": data["intake_code"],
+                    "conflict_fields": conflict_fields,
+                    "submitted": submitted,
+                    "existing": stored,
+                },
+            )
+            return {
+                "outcome": "conflict",
+                "context": {
+                    "intake_code": data["intake_code"],
+                    "existing_batch_id": existing["id"],
+                    "conflict_fields": conflict_fields,
+                    "submitted": submitted,
+                    "existing": stored,
+                },
+            }
+        # 安全重放：仅留重放审计，不新增批次、不改动计数/状态/二维码
+        self.audit.record(
+            principal,
+            "batch.receive.replay",
+            "receipt_batch",
+            str(existing["id"]),
+            after=existing,
+            metadata={"intake_code": existing["intake_code"], "replayed": True},
+        )
+        return {"outcome": "replayed", "batch": existing}
 
     def register_dossier(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.write")

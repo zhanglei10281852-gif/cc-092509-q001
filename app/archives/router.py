@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from app.api.dependencies import current_principal
 from app.database import get_connection, transaction
 from app.core.security import Principal
+from app.core.errors import ConflictError
 from app.archives.schemas import (
     CopyIssueRequest,
     IncidentCreate,
@@ -33,10 +36,20 @@ def list_vaults(principal: Principal = Depends(current_principal)):
     return VaultService(get_connection()).list(principal)
 
 
-@router.post("/batches", status_code=status.HTTP_201_CREATED)
+@router.post("/batches")
 def create_batch(payload: BatchCreate, principal: Principal = Depends(current_principal)):
+    # 冲突异常必须在事务提交后抛出，否则随回滚丢失 batch.receive.conflict 审计
     with transaction(immediate=True) as connection:
-        return DossierLifecycleService(connection).create_batch(principal, payload.model_dump())
+        result = DossierLifecycleService(connection).create_batch(principal, payload.model_dump())
+    outcome = result["outcome"]
+    if outcome in {"created", "replayed"}:
+        # 保持批次字段平铺，新增明确的重放标记；创建返回 201，安全重放返回 200
+        body = {**result["batch"], "replayed": outcome == "replayed"}
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED if outcome == "created" else status.HTTP_200_OK,
+            content=jsonable_encoder(body),
+        )
+    raise ConflictError("移交批次编码已被不同业务字段占用", context=result["context"])
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

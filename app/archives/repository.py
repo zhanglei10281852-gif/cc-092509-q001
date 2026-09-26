@@ -58,6 +58,12 @@ class IntakeRepository:
     def get(self, intake_id: int) -> dict[str, Any]:
         return row_dict(self.connection.execute("SELECT * FROM intake_batches WHERE id=?", (intake_id,)).fetchone())
 
+    def by_code(self, intake_code: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM intake_batches WHERE intake_code=?", (intake_code,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def update_counts(self, intake_id: int, now: str) -> dict[str, Any]:
         accepted = self.connection.execute("SELECT COUNT(*) FROM dossiers WHERE intake_id=?", (intake_id,)).fetchone()[0]
         self.connection.execute(
